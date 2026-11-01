@@ -1,0 +1,46 @@
+# —— common ——
+# 依赖
+node_modules/
+vendor/
+
+# 构建产物
+dist/
+build/
+out/
+target/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 日志与缓存
+*.log
+.cache/
+tmp/
+temp/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# —— node ——
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+.npm/
+.next/
+.nuxt/
+coverage/
+*.tsbuildinfo
