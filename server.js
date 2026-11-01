@@ -455,6 +455,146 @@ function sanitizeRepoName(raw) {
   return n.slice(0, 100);
 }
 
+/* ------------------------------------------------------------------ */
+/* git 协议被挡时的后路：走 GitHub Git Data API 直接提交               */
+/* ------------------------------------------------------------------ */
+
+const NET_FAIL = /CONNECT tunnel failed|schannel|unable to access|Could not resolve|Connection reset|Connection refused|timed out|Failed to connect|RPC failed|502|503|504/i;
+
+async function apiPush({ dir, token, fullName, branch, em, message, force }) {
+  const BASE = 'https://api.github.com';
+  const sleep = (ms) => new Promise((s) => setTimeout(s, ms));
+
+  async function gh(method, url, body) {
+    for (let i = 0; i < 5; i++) {
+      let r, txt;
+      try {
+        r = await fetch(BASE + url, {
+          method,
+          headers: {
+            Authorization: 'Bearer ' + token,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'GitPorter',
+          },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        txt = await r.text();
+      } catch (e) {
+        if (i === 4) throw e;
+        await sleep(1500 * (i + 1));
+        continue;
+      }
+      if ((r.status === 403 || r.status === 429) && i < 4) {
+        const wait = Number(r.headers.get('retry-after') || 15);
+        em.log('接口限流，等待 ' + wait + ' 秒…', 'warn');
+        await sleep(wait * 1000);
+        continue;
+      }
+      if (!r.ok) {
+        const err = new Error(method + ' ' + url + ' → ' + r.status + ' ' + txt.slice(0, 200));
+        err.status = r.status;
+        throw err;
+      }
+      return txt ? JSON.parse(txt) : {};
+    }
+  }
+
+  // 空仓库无法建 blob，先垫一个占位提交
+  let hasCommit = true;
+  try {
+    await gh('GET', '/repos/' + fullName + '/commits?per_page=1');
+  } catch (e) {
+    if (e.status === 409 || e.status === 404) hasCommit = false;
+    else throw e;
+  }
+  if (!hasCommit) {
+    em.log('仓库还是空的，先建一个占位提交…', 'dim');
+    await gh('PUT', '/repos/' + fullName + '/contents/.gitporter-init', {
+      message: '初始化',
+      content: Buffer.from('GitPorter 占位文件\n').toString('base64'),
+      branch,
+    });
+  }
+
+  // 本地已跟踪文件（遵守 .gitignore）
+  const lsOut = await runCapture('git', ['ls-files', '-z'], { cwd: dir });
+  const files = String(lsOut.out || '').split('\0').filter(Boolean);
+  if (!files.length) throw new Error('没有可上传的文件');
+  em.log('改用接口上传 ' + files.length + ' 个文件…', 'info');
+
+  const entries = [];
+  let done = 0;
+  let bytes = 0;
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < files.length) {
+      const rel = files[cursor++];
+      let buf;
+      try {
+        buf = await fsp.readFile(path.join(dir, rel));
+      } catch (_) {
+        continue;
+      }
+      bytes += buf.length;
+      const b = await gh('POST', '/repos/' + fullName + '/git/blobs', {
+        content: buf.toString('base64'),
+        encoding: 'base64',
+      });
+      entries.push({ path: rel.split(path.sep).join('/'), mode: '100644', type: 'blob', sha: b.sha });
+      done++;
+      if (done % 50 === 0 || done === files.length) {
+        em.log('已上传 ' + done + '/' + files.length + '（' + (bytes / 1048576).toFixed(1) + 'MB）', 'dim');
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: 4 }, worker));
+  if (!entries.length) throw new Error('没有可上传的文件');
+
+  // 条目过多会被 GitHub 判超时，分块用 base_tree 累积
+  let treeSha = null;
+  const CHUNK = 200;
+  for (let i = 0; i < entries.length; i += CHUNK) {
+    const part = entries.slice(i, i + CHUNK);
+    const body = treeSha ? { tree: part, base_tree: treeSha } : { tree: part };
+    const t = await gh('POST', '/repos/' + fullName + '/git/trees', body);
+    treeSha = t.sha;
+  }
+
+  let parents = [];
+  try {
+    const ref = await gh('GET', '/repos/' + fullName + '/git/ref/heads/' + branch);
+    parents = [ref.object.sha];
+  } catch (e) {
+    if (e.status !== 404) throw e;
+  }
+
+  const commit = await gh('POST', '/repos/' + fullName + '/git/commits', {
+    message: message || 'GitPorter 上传',
+    tree: treeSha,
+    parents,
+  });
+
+  if (parents.length) {
+    await gh('PATCH', '/repos/' + fullName + '/git/refs/heads/' + branch, {
+      sha: commit.sha,
+      force: !!force,
+    });
+  } else {
+    await gh('POST', '/repos/' + fullName + '/git/refs', {
+      ref: 'refs/heads/' + branch,
+      sha: commit.sha,
+    });
+  }
+
+  return { files: entries.length, bytes, commit: commit.sha };
+}
+
+/* ------------------------------------------------------------------ */
+/* 上传流程                                                            */
+/* ------------------------------------------------------------------ */
+
 async function handlePush(req, res, body) {
   const em = makeEmitter(res);
   streamHead(res);
@@ -654,11 +794,34 @@ async function handlePush(req, res, body) {
     });
 
     if (pCode !== 0) {
-      const hint = explainGitError(pErr.join('\n'));
-      await logEvent('push:git-fail', { dir, fullName, code: pCode, tail: pErr.slice(-6).join(' | ') });
-      em.fail('推送失败', hint);
-      em.end();
-      return;
+      const raw = pErr.join('\n');
+      if (NET_FAIL.test(raw)) {
+        const why = (raw.match(NET_FAIL) || ['网络中断'])[0];
+        em.log('git 传输通道不通（' + why + '），自动改用 GitHub 接口上传…', 'warn');
+        try {
+          const r = await apiPush({
+            dir,
+            token,
+            fullName,
+            branch,
+            em,
+            message: body.commitMessage || 'GitPorter 上传',
+            force: body.force,
+          });
+          em.log('接口上传完成：' + r.files + ' 个文件，' + (r.bytes / 1048576).toFixed(1) + 'MB', 'ok');
+        } catch (e2) {
+          await logEvent('push:api-fail', { dir, fullName, message: e2.message });
+          em.fail('两种方式都没成功', e2.message);
+          em.end();
+          return;
+        }
+      } else {
+        const hint = explainGitError(raw);
+        await logEvent('push:git-fail', { dir, fullName, code: pCode, tail: pErr.slice(-6).join(' | ') });
+        em.fail('推送失败', hint);
+        em.end();
+        return;
+      }
     }
     em.step('push', 'done');
     em.log('上传完成 ✓', 'ok');
