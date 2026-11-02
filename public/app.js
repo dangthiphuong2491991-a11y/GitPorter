@@ -40,10 +40,31 @@ function setBusy(v, hint) {
   busy = v;
   ['#btnUpload', '#btnReplace', '#btnDownload', '#btnUpdate'].forEach((s) => { $(s).disabled = v; });
   if (!v) syncReplaceBtn();
+  const stop = $('#btnStop');
+  if (stop) {
+    stop.style.display = v ? '' : 'none';
+    stop.disabled = false;
+    stop.textContent = '■ 停止';
+  }
   const st = $('#consoleStatus');
   if (v) { st.classList.remove('ok'); st.classList.remove('bad'); st.textContent = hint || '执行中…'; }
   else if (!st.classList.contains('ok') && !st.classList.contains('bad')) st.textContent = '';
 }
+
+$('#btnStop').onclick = async () => {
+  if (!busy) return;
+  const b = $('#btnStop');
+  b.disabled = true;
+  b.textContent = '停止中…';
+  log('正在停止…', 'warn');
+  try {
+    await post('/api/cancel', {});
+  } catch (e) {
+    toast('停止失败：' + e.message, 'err');
+    b.disabled = false;
+    b.textContent = '■ 停止';
+  }
+};
 
 /** 复制到剪贴板，失败时退回老办法 */
 function copyText(t) {
@@ -437,20 +458,68 @@ async function loadState() {
   }
 }
 
-async function loadRepos() {
-  if (!state.hasToken) return;
+let reposUpdatedAt = 0;
+let reposLoading = false;
+
+function renderRepoSelect() {
+  const sel = $('#pullRepoSelect');
+  if (!sel) return;
+  const kw = (($('#repoFilter') && $('#repoFilter').value) || '').trim().toLowerCase();
+  const list = kw ? repos.filter((r) => r.fullName.toLowerCase().includes(kw)) : repos;
+  const prev = sel.value;
+
+  sel.innerHTML = '<option value="">— 选择仓库 —</option>';
+  list.forEach((r) => {
+    const o = document.createElement('option');
+    o.value = r.cloneUrl;
+    o.textContent = r.fullName + (r.private ? '（私有）' : '');
+    sel.appendChild(o);
+  });
+  if (prev && list.some((r) => r.cloneUrl === prev)) sel.value = prev;
+
+  const filter = $('#repoFilter');
+  if (filter) {
+    filter.style.display = repos.length > 8 ? 'block' : 'none';
+    if (repos.length <= 8) filter.value = '';
+  }
+  const empty = $('#repoEmpty');
+  if (empty) empty.style.display = repos.length ? 'none' : 'block';
+}
+
+function repoAgo() {
+  if (!reposUpdatedAt) return '还没读取';
+  const s = Math.round((Date.now() - reposUpdatedAt) / 1000);
+  if (s < 10) return '刚刚更新';
+  if (s < 60) return s + ' 秒前更新';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前更新';
+  return Math.floor(s / 3600) + ' 小时前更新';
+}
+
+function renderRepoMeta() {
+  const m = $('#repoMeta');
+  if (!m) return;
+  m.textContent = repos.length ? '共 ' + repos.length + ' 个 · ' + repoAgo() : repoAgo();
+}
+
+async function loadRepos(silent) {
+  if (!state.hasToken || reposLoading) return;
+  reposLoading = true;
+  const btn = $('#btnRefreshRepos');
+  if (btn) btn.classList.add('spinning');
+  if (!silent && $('#repoMeta')) $('#repoMeta').textContent = '正在读取…';
   try {
     const d = await post('/api/repos', {});
     repos = d.repos || [];
-    const sel = $('#pullRepoSelect');
-    sel.innerHTML = '<option value="">— 选择仓库 —</option>';
-    repos.forEach((r) => {
-      const o = document.createElement('option');
-      o.value = r.cloneUrl;
-      o.textContent = r.fullName + (r.private ? '（私有）' : '');
-      sel.appendChild(o);
-    });
-  } catch (e) { /* 静默 */ }
+    reposUpdatedAt = Date.now();
+    renderRepoSelect();
+    renderRepoMeta();
+  } catch (e) {
+    if ($('#repoMeta')) $('#repoMeta').textContent = '读取失败';
+    if (!silent) toast('读不到仓库列表：' + e.message, 'err', 5000);
+  } finally {
+    reposLoading = false;
+    if (btn) btn.classList.remove('spinning');
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -576,6 +645,11 @@ $$('.action-card').forEach((card) => {
     $$('.action-card').forEach((c) => c.classList.toggle('active', c === card));
     $$('.panel').forEach((p) => p.classList.toggle('show', p.id === 'panel-' + act));
     $('#panel-' + act).scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // 切到拉取面板就顺手刷一次，保证看到的是 GitHub 现状
+    if (act === 'pull') {
+      loadRepos(true);
+      setTimeout(() => $('#pullRepoSelect') && $('#pullRepoSelect').focus(), 350);
+    }
   };
 });
 
@@ -591,6 +665,36 @@ $$('#pullMode button').forEach((b) => {
 $('#pullRepoSelect').onchange = (e) => {
   if (e.target.value) $('#pullUrl').value = e.target.value;
 };
+
+/* 仓库列表：手动刷新 + 关键字筛选 */
+$('#btnRefreshRepos').onclick = () => loadRepos(false);
+$('#repoFilter').addEventListener('input', renderRepoSelect);
+$('#repoFilter').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const sel = $('#pullRepoSelect');
+    if (sel.options.length === 2) {
+      sel.selectedIndex = 1;
+      sel.dispatchEvent(new Event('change'));
+      $('#repoFilter').value = '';
+      renderRepoSelect();
+    }
+  }
+});
+
+/* 时间戳每 15 秒走一次，让人知道数据新不新 */
+setInterval(() => {
+  if ($('#panel-pull') && $('#panel-pull').classList.contains('show')) renderRepoMeta();
+}, 15000);
+
+/* 停在拉取面板时，每 90 秒静默同步一次 GitHub */
+setInterval(() => {
+  if ($('#panel-pull') && $('#panel-pull').classList.contains('show') && !busy) loadRepos(true);
+}, 90000);
+
+/* 回到窗口时也顺手刷一下 */
+window.addEventListener('focus', () => {
+  if ($('#panel-pull') && $('#panel-pull').classList.contains('show') && !busy) loadRepos(true);
+});
 $('#repConfirm').onchange = syncReplaceBtn;
 
 function syncReplaceBtn() {
@@ -827,6 +931,8 @@ $('#btnUpdate').onclick = async () => {
 /* ------------------------------------------------------------------ */
 
 $('#btnSettings').onclick = () => $('#settingsOverlay').classList.add('show');
+$('#settingsClose').onclick = () => $('#settingsOverlay').classList.remove('show');
+$('#settingsDone').onclick = () => $('#settingsOverlay').classList.remove('show');
 $('#settingsOverlay').onclick = (e) => { if (e.target === $('#settingsOverlay')) $('#settingsOverlay').classList.remove('show'); };
 
 $('#btnSaveToken').onclick = async () => {

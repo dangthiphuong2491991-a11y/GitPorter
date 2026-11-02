@@ -126,6 +126,29 @@ function readBody(req) {
 /* 进程执行（流式输出，用于 git 命令）                                 */
 /* ------------------------------------------------------------------ */
 
+// 当前正在跑的任务，用于「停止」按钮
+const CURRENT = { child: null, abort: null, cancelled: false };
+
+function resetCurrent() {
+  CURRENT.child = null;
+  CURRENT.abort = null;
+  CURRENT.cancelled = false;
+}
+
+function cancelCurrent() {
+  CURRENT.cancelled = true;
+  let killed = false;
+  if (CURRENT.child) {
+    try { CURRENT.child.kill('SIGKILL'); killed = true; } catch (_) {}
+    CURRENT.child = null;
+  }
+  if (CURRENT.abort) {
+    try { CURRENT.abort.abort(); } catch (_) {}
+    CURRENT.abort = null;
+  }
+  return killed;
+}
+
 function runStream(cmd, args, opts, onLine) {
   return new Promise((resolve) => {
     let child;
@@ -156,8 +179,10 @@ function runStream(cmd, args, opts, onLine) {
     };
     child.stdout.on('data', flush);
     child.stderr.on('data', flush);
+    CURRENT.child = child;
     child.on('error', (e) => { onLine(String(e.message || e)); resolve(-1); });
     child.on('close', (code) => {
+      if (CURRENT.child === child) CURRENT.child = null;
       if (acc.trim() !== '') onLine(acc.trim());
       resolve(code === null ? -1 : code);
     });
@@ -464,9 +489,20 @@ const NET_FAIL = /CONNECT tunnel failed|schannel|unable to access|Could not reso
 async function apiPush({ dir, token, fullName, branch, em, message, force }) {
   const BASE = 'https://api.github.com';
   const sleep = (ms) => new Promise((s) => setTimeout(s, ms));
+  const ac = new AbortController();
+  CURRENT.abort = ac;
+
+  function checkCancel() {
+    if (CURRENT.cancelled) {
+      const e = new Error('已取消');
+      e.cancelled = true;
+      throw e;
+    }
+  }
 
   async function gh(method, url, body) {
     for (let i = 0; i < 5; i++) {
+      checkCancel();
       let r, txt;
       try {
         r = await fetch(BASE + url, {
@@ -478,9 +514,15 @@ async function apiPush({ dir, token, fullName, branch, em, message, force }) {
             'User-Agent': 'GitPorter',
           },
           body: body ? JSON.stringify(body) : undefined,
+          signal: ac.signal,
         });
         txt = await r.text();
       } catch (e) {
+        if (e.name === 'AbortError' || CURRENT.cancelled) {
+          const ce = new Error('已取消');
+          ce.cancelled = true;
+          throw ce;
+        }
         if (i === 4) throw e;
         await sleep(1500 * (i + 1));
         continue;
@@ -530,6 +572,7 @@ async function apiPush({ dir, token, fullName, branch, em, message, force }) {
 
   async function worker() {
     while (cursor < files.length) {
+      checkCancel();
       const rel = files[cursor++];
       let buf;
       try {
@@ -598,6 +641,7 @@ async function apiPush({ dir, token, fullName, branch, em, message, force }) {
 async function handlePush(req, res, body) {
   const em = makeEmitter(res);
   streamHead(res);
+  resetCurrent();
 
   let repoUrl = '';
   await logEvent('push:start', {
@@ -795,9 +839,14 @@ async function handlePush(req, res, body) {
 
     if (pCode !== 0) {
       const raw = pErr.join('\n');
-      if (NET_FAIL.test(raw)) {
-        const why = (raw.match(NET_FAIL) || ['网络中断'])[0];
-        em.log('git 传输通道不通（' + why + '），自动改用 GitHub 接口上传…', 'warn');
+      const nonFF = /non-fast-forward|rejected|fetch first|Updates were rejected/i.test(raw);
+      if (NET_FAIL.test(raw) || nonFF) {
+        if (nonFF) {
+          em.log('云端有本地没有的提交，改用接口把两边合并上传…', 'warn');
+        } else {
+          const why = (raw.match(NET_FAIL) || ['网络中断'])[0];
+          em.log('git 传输通道不通（' + why + '），自动改用 GitHub 接口上传…', 'warn');
+        }
         try {
           const r = await apiPush({
             dir,
@@ -833,6 +882,12 @@ async function handlePush(req, res, body) {
     em.done({ repoUrl, fullName, branch, dir });
     em.end();
   } catch (e) {
+    if (e.cancelled) {
+      em.log('已停止。云端不会留下这次不完整的内容。', 'warn');
+      em.fail('已停止', '你手动停止了这次上传，云端内容保持原样。');
+      em.end();
+      return;
+    }
     await logEvent('push:fail', {
       dir: body.dir, mode: body.mode, repoName: body.repoName || '',
       message: e.message || String(e), status: e.status || 0,
@@ -849,6 +904,7 @@ async function handlePush(req, res, body) {
 async function handleClone(req, res, body) {
   const em = makeEmitter(res);
   streamHead(res);
+  resetCurrent();
   try {
     let raw = String(body.url || '').trim();
     if (!raw) throw new Error('请填写仓库地址');
@@ -919,6 +975,7 @@ async function handleClone(req, res, body) {
 async function handlePull(req, res, body) {
   const em = makeEmitter(res);
   streamHead(res);
+  resetCurrent();
   try {
     const dir = path.resolve(String(body.dir || '').trim());
     if (!(await exists(path.join(dir, '.git')))) throw new Error('这个文件夹不是 git 仓库');
@@ -1200,6 +1257,11 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/pull' && req.method === 'POST') {
       const b = await readBody(req);
       return handlePull(req, res, b);
+    }
+
+    if (p === '/api/cancel' && req.method === 'POST') {
+      const killed = cancelCurrent();
+      return json(res, 200, { ok: true, killed });
     }
 
     if (p === '/api/quit' && req.method === 'POST') {

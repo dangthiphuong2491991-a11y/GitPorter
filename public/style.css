@@ -131,6 +131,16 @@ body {
 .panel.show { display: block; animation: fade .2s ease; }
 @keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 
+/* 面板切换后滚动定位留一点余量，别把卡片顶部切掉 */
+.panel { scroll-margin-top: 14px; }
+
+/* 刷新按钮：转起来才像在工作 */
+@keyframes spin { to { transform: rotate(360deg); } }
+.ico-refresh { transition: transform .2s ease; }
+#btnRefreshRepos.spinning { opacity: .75; cursor: progress; }
+#btnRefreshRepos.spinning .ico-refresh { animation: spin .8s linear infinite; }
+#btnRefreshRepos:active .ico-refresh { transform: rotate(-90deg); }
+
 /* ---------- 表单 ---------- */
 .field { margin-bottom: 12px; }
 .field:last-child { margin-bottom: 0; }
